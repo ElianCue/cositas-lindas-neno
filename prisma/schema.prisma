@@ -1,0 +1,253 @@
+// Cositas Lindas Neno — modelo de datos
+// Postgres (Supabase) + Prisma 6. Comandos: pnpm db:migrate · pnpm db:seed · pnpm db:studio
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ============================================================
+// Enums
+// ============================================================
+
+enum Rol {
+  ADMIN // 👑 acceso total (usuarios, config, auditoría)
+  ADMIN_NENO // 👩🏻‍💼 gestión del negocio
+  CLIENTE // 🛍️ solo su cuenta y sus pedidos
+}
+
+enum OrderEstado {
+  PENDIENTE // recién creado, pendiente de confirmación por WhatsApp
+  CONTACTADO // lo contactamos por WhatsApp
+  CONFIRMADO // confirmado → acá se descuenta stock
+  PAGADO
+  PREPARANDO
+  ENVIADO
+  ENTREGADO
+  CANCELADO // si estaba confirmado, se restaura el stock
+}
+
+enum FormaPago {
+  TRANSFERENCIA
+  EFECTIVO
+  MERCADOPAGO
+  OTRO
+}
+
+enum FormaEntrega {
+  ENVIO
+  RETIRO_LOCAL
+}
+
+// ============================================================
+// Usuarios (staff + clientes en una sola tabla, distinguibles por rol)
+// ============================================================
+
+model User {
+  id         String   @id @default(cuid())
+  email      String   @unique
+  password   String // bcrypt
+  nombre     String
+  telefono   String? // WhatsApp del cliente (obligatorio para CLIENTE, se valida en la app)
+  rol        Rol      @default(CLIENTE)
+  activo     Boolean  @default(true)
+  direccion  String?
+  localidad  String?
+  cp         String?
+  notas      String? // interno del staff
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  orders     Order[]
+  audit_logs AuditLog[]
+  payments   Payment[]
+
+  @@index([rol])
+  @@index([nombre])
+}
+
+// ============================================================
+// Catálogo
+// ============================================================
+
+model Category {
+  id         String   @id @default(cuid())
+  nombre     String
+  slug       String   @unique
+  orden      Int      @default(0)
+  activo     Boolean  @default(true)
+  created_at DateTime @default(now())
+
+  products Product[]
+}
+
+model Product {
+  id           String   @id @default(cuid())
+  nombre       String
+  slug         String   @unique
+  descripcion  String?  @db.Text
+  precio       Int // pesos AR (entero)
+  stock        Int      @default(0) // stock físico; se descuenta al CONFIRMAR un pedido
+  categoria_id String
+  activo       Boolean  @default(true)
+  destacado    Boolean  @default(false)
+  created_at   DateTime @default(now())
+  updated_at   DateTime @updatedAt
+
+  categoria   Category       @relation(fields: [categoria_id], references: [id], onDelete: Restrict)
+  imagenes    ProductImage[]
+  order_items OrderItem[]
+
+  @@index([categoria_id])
+  @@index([activo])
+  @@index([nombre])
+}
+
+model ProductImage {
+  id         String  @id @default(cuid())
+  product_id String
+  url        String
+  path       String? // ruta interna en el bucket (para poder borrar el archivo)
+  orden      Int     @default(0)
+  alt        String?
+
+  product Product @relation(fields: [product_id], references: [id], onDelete: Cascade)
+
+  @@index([product_id, orden])
+}
+
+// ============================================================
+// Pedidos
+// ============================================================
+
+model Order {
+  id           String      @id @default(cuid())
+  numero       Int         @unique // 125 → se muestra como "#000125"
+  public_token String      @unique @default(uuid()) // identificador no adivinable para la vista pública
+  estado       OrderEstado @default(PENDIENTE)
+
+  // Flags que se pueden marcar independientemente del estado
+  pagado    Boolean @default(false)
+  enviado   Boolean @default(false)
+  entregado Boolean @default(false)
+
+  // Cliente (snapshot al momento del pedido; user_id puede ser null en pedidos manuales)
+  user_id          String?
+  cliente_nombre   String
+  cliente_whatsapp String
+  cliente_email    String?
+
+  // Totales (snapshots)
+  subtotal Int
+  envio    Int @default(0)
+  total    Int
+
+  forma_pago    FormaPago
+  forma_entrega FormaEntrega
+  direccion     String?
+  notas         String?
+
+  created_at    DateTime  @default(now())
+  updated_at    DateTime  @updatedAt
+  confirmado_at DateTime?
+  entregado_at  DateTime?
+
+  user     User?       @relation(fields: [user_id], references: [id], onDelete: SetNull)
+  items    OrderItem[]
+  payments Payment[]
+
+  @@index([estado])
+  @@index([created_at])
+  @@index([user_id])
+}
+
+model OrderItem {
+  id         String  @id @default(cuid())
+  order_id   String
+  product_id String?
+  nombre     String // snapshot
+  precio     Int // snapshot (pesos)
+  cantidad   Int
+  subtotal   Int // precio * cantidad
+
+  order   Order    @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [product_id], references: [id], onDelete: SetNull)
+
+  @@index([order_id])
+  @@index([product_id])
+}
+
+// ============================================================
+// Pagos
+// ============================================================
+
+model Payment {
+  id             String    @id @default(cuid())
+  order_id       String
+  monto          Int
+  metodo         FormaPago
+  comprobante    String?
+  notas          String?
+  fecha          DateTime  @default(now())
+  registrado_por String? // User.id de quien lo registró
+
+  order Order @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  user  User? @relation(fields: [registrado_por], references: [id], onDelete: SetNull)
+
+  @@index([order_id])
+  @@index([fecha])
+}
+
+// ============================================================
+// Auditoría — quién modificó qué y cuándo
+// "Stock de Scrunchie modificado de 8 a 6 — Sofi — 28/09/2026 15:32"
+// ============================================================
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  user_id     String?
+  user_nombre String // snapshot (aunque el usuario se elimine)
+  accion      String // CREAR_PRODUCTO, MODIFICAR_STOCK, CAMBIAR_ESTADO, ...
+  entidad     String // product, order, user, category, payment...
+  entidad_id  String?
+  detalle     String // texto legible del cambio
+  created_at  DateTime @default(now())
+
+  user User? @relation(fields: [user_id], references: [id], onDelete: SetNull)
+
+  @@index([created_at])
+  @@index([entidad, entidad_id])
+  @@index([user_id])
+}
+
+// ============================================================
+// Configuración de la tienda (key/value) — editable desde /admin/config
+// ej: whatsapp_numero, envio_precio, horarios
+// ============================================================
+
+model Setting {
+  clave      String   @id
+  valor      String
+  updated_at DateTime @updatedAt
+}
+
+// Contador atómico para numerar pedidos (#000125) y otros consecutivos
+model Counter {
+  clave String @id
+  valor Int    @default(0)
+}
+
+// Rate limiting respaldado en Postgres (funciona con múltiples instancias)
+model RateLimit {
+  key        String   @id
+  count      Int      @default(0)
+  reset_at   DateTime
+  updated_at DateTime @updatedAt
+
+  @@index([reset_at])
+}
